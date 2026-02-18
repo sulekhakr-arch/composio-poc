@@ -58,15 +58,6 @@ composio_langgraph = Composio(provider=LanggraphProvider())
 # Step 1 — Auth Config (created in code, no dashboard)
 # =============================================================================
 
-# Required OAuth scopes per app
-APP_SCOPES = {
-    "GITHUB": "repo,user,read:org",
-    "GMAIL": "https://mail.google.com/,https://www.googleapis.com/auth/gmail.send,https://www.googleapis.com/auth/gmail.readonly,https://www.googleapis.com/auth/gmail.compose,https://www.googleapis.com/auth/gmail.modify",
-    "SLACK": "chat:write,channels:read,users:read",
-    "GOOGLECALENDAR": "https://www.googleapis.com/auth/calendar,https://www.googleapis.com/auth/calendar.events,https://www.googleapis.com/auth/calendar.readonly",
-    "NOTION": None,
-}
-
 # Cache auth config IDs so we don't recreate every run
 AUTH_CONFIG_CACHE_FILE = os.path.join(os.path.dirname(__file__), "auth_configs.json")
 
@@ -106,18 +97,13 @@ def get_or_create_auth_config(toolkit: str) -> str:
         pass
 
     # 3. Create a new one programmatically
-    scopes = APP_SCOPES.get(toolkit)
-    options = {
-        "name": f"{toolkit}_full_access",
-        "type": "use_composio_managed_auth",
-    }
-    if scopes:
-        options["credentials"] = {"scopes": scopes}
-
     try:
         response = composio_client.auth_configs.create(
             toolkit=toolkit.lower(),
-            options=options,
+            options={
+                "name": f"{toolkit}_full_access",
+                "type": "use_composio_managed_auth",
+            },
         )
         auth_config_id = response.id
     except Exception as exc:
@@ -807,10 +793,6 @@ FUNCTION_TOOL_MAP = [
     },
     {
         "keywords": ["send", "slack"],
-        "slug": "SLACK_SENDS_A_MESSAGE_TO_A_SLACK_CHANNEL",
-    },
-    {
-        "keywords": ["send", "message", "slack"],
         "slug": "SLACK_SENDS_A_MESSAGE_TO_A_SLACK_CHANNEL",
     },
 ]
