@@ -1,0 +1,8 @@
+# Composio + LangGraph POC
+# composio-langgraph pulls in composio-core. Do NOT install the main 'composio'
+# package alongside it (causes ModuleNotFoundError: composio.__version__).
+composio-langgraph>=0.10.0
+langgraph>=0.2.0
+langchain-openai>=0.2.0
+langchain-core>=0.3.0
+python-dotenv>=1.0.0
