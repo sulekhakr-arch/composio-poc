@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 users.json
 auth_configs.json
+contracts/

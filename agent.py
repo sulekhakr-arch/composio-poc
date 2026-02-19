@@ -433,76 +433,35 @@ def build_agent(toolkits: list, user_id: str):
 
 
 # =============================================================================
-# AI Tool Abstraction Layer
-# Classifies Composio tool fields → Primary / Secondary / Auto
+# Tool Abstraction Layer (API-based, no LLM call)
+# Fetches tool schema from Composio API → splits into Primary / Secondary / Auto
 # =============================================================================
 
-FIELD_CLASSIFICATION_PROMPT = """You are an AI tool abstraction layer for MyOperator.
+# Fields that are always system-controlled (user never sees these)
+AUTO_FIELD_KEYS = {
+    "calendar_id", "calendarid", "send_updates", "sendupdates",
+    "conferencedata", "conference_data", "reminders",
+    "visibility", "transparency", "guestscanmodify",
+    "guestscaninviteothers", "guestscanseeotherguests",
+}
 
-Given a user's objective and a Composio tool's parameters, classify each field into:
-- PRIMARY: Essential input needed for the user's goal
-- SECONDARY: Optional config with sensible defaults (e.g. timezone, duration)
-- AUTO: System-controlled, user never sees (e.g. calendar_id="primary", send_updates=true)
-
-PRIMARY fields have two sub-types — this is critical:
-- STATIC (is_dynamic=false): The value CAN be inferred from the user's objective.
-  Example: user says "book dentist appointment" → title = "Dentist Appointment" (inferred).
-  For static fields, you MUST provide "generated_value" with the inferred value and
-  "generated_description" explaining how it was derived from the objective.
-- DYNAMIC (is_dynamic=true): The value is unique/personal and CANNOT be inferred.
-  Example: attendee email, specific date/time — these must be asked.
-  For dynamic fields, provide "description" with a plain English prompt for the user.
-
-Rules:
-1. Minimize PRIMARY fields — only what's absolutely needed
-2. Among primary, maximize STATIC — infer as much as possible from the objective
-3. Only mark a field DYNAMIC if its value is truly unknowable from the objective
-4. Assign safe defaults for SECONDARY and AUTO fields
-5. Return valid JSON only, no markdown
-
-User Objective: {objective}
-Tool: {tool_name}
-Tool Description: {tool_description}
-Tool Parameters: {tool_params}
-
-Return JSON in this exact format:
-{{
-  "tool_slug": "{tool_slug}",
-  "objective": "{objective}",
-  "primary_fields": [
-    {{
-      "field_key": "parameter_name",
-      "label": "Human-friendly label",
-      "is_dynamic": false,
-      "generated_value": "value inferred from the objective",
-      "generated_description": "How this was inferred from the objective"
-    }},
-    {{
-      "field_key": "parameter_name",
-      "label": "Human-friendly label",
-      "is_dynamic": true,
-      "description": "Plain English prompt asking the user for this value"
-    }}
-  ],
-  "secondary_fields": [
-    {{
-      "field_key": "parameter_name",
-      "label": "Human-friendly label",
-      "default_value": "sensible default"
-    }}
-  ],
-  "auto_fields": [
-    {{
-      "field_key": "parameter_name",
-      "value": "auto value"
-    }}
-  ]
-}}
-"""
+# Fields that have sensible defaults (user can skip)
+SECONDARY_DEFAULTS = {
+    "timezone": "Asia/Kolkata",
+    "duration": "60",
+    "location": "",
+    "description": "",
+    "colorid": "",
+    "recurrence": "",
+    "state": "open",
+    "labels": "",
+    "assignees": "",
+    "milestone": "",
+}
 
 
 def get_tool_schema(tool_slug: str, user_id: str) -> dict:
-    """Fetch the full schema/parameters for a Composio tool."""
+    """Fetch the full schema/parameters for a Composio tool via API."""
     try:
         tools = composio_langgraph.tools.get(user_id=user_id, tools=[tool_slug])
         if tools:
@@ -523,34 +482,66 @@ def get_tool_schema(tool_slug: str, user_id: str) -> dict:
 
 def classify_tool_fields(objective: str, tool_slug: str, user_id: str) -> dict:
     """
-    Use LLM to classify a Composio tool's fields into Primary/Secondary/Auto.
-    Returns the JSON contract for UI rendering and execution.
+    Classify tool fields using the API schema directly — no LLM call.
+    Required fields → Primary (ask user), Optional known defaults → Secondary, Rest → Auto.
     """
     schema = get_tool_schema(tool_slug, user_id)
     if not schema:
         return None
 
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-    prompt = FIELD_CLASSIFICATION_PROMPT.format(
-        objective=objective,
-        tool_name=schema.get("name", tool_slug),
-        tool_description=schema.get("description", ""),
-        tool_params=json.dumps(schema.get("parameters", {}), indent=2),
-        tool_slug=tool_slug,
-    )
+    params = schema.get("parameters", {})
+    required = set(schema.get("required", []))
 
-    response = llm.invoke([HumanMessage(content=prompt)])
+    primary_fields = []
+    secondary_fields = []
+    auto_fields = []
 
-    try:
-        content = response.content.strip()
-        if content.startswith("```"):
-            content = content.split("```")[1]
-            if content.startswith("json"):
-                content = content[4:]
-        return json.loads(content)
-    except (json.JSONDecodeError, IndexError):
-        print("    [!] Could not parse LLM response")
-        return None
+    for key, prop in params.items():
+        key_lower = key.lower()
+        label = prop.get("title", key.replace("_", " ").title())
+        description = prop.get("description", "")
+
+        if key_lower in AUTO_FIELD_KEYS:
+            default = prop.get("default", "")
+            auto_fields.append({
+                "field_key": key,
+                "value": default if default else "primary" if "calendar" in key_lower else "true",
+            })
+        elif key_lower in SECONDARY_DEFAULTS:
+            secondary_fields.append({
+                "field_key": key,
+                "label": label,
+                "default_value": SECONDARY_DEFAULTS[key_lower],
+            })
+        elif key in required:
+            primary_fields.append({
+                "field_key": key,
+                "label": label,
+                "is_dynamic": True,
+                "description": description or f"Enter the {label}",
+            })
+        else:
+            default = prop.get("default", "")
+            if default:
+                secondary_fields.append({
+                    "field_key": key,
+                    "label": label,
+                    "default_value": str(default),
+                })
+            else:
+                secondary_fields.append({
+                    "field_key": key,
+                    "label": label,
+                    "default_value": "",
+                })
+
+    return {
+        "tool_slug": tool_slug,
+        "objective": objective,
+        "primary_fields": primary_fields,
+        "secondary_fields": secondary_fields,
+        "auto_fields": auto_fields,
+    }
 
 
 NL_CONVERT_PROMPT = """Convert the user's natural language input into the exact API format required.
@@ -620,9 +611,8 @@ def validate_input(field_key: str, value: str) -> tuple:
 
 def collect_primary_fields(contract: dict) -> dict:
     """
-    Collect primary fields conversationally.
-    - Static fields (is_dynamic=false): auto-filled from the objective, shown to user
-    - Dynamic fields (is_dynamic=true): asked one at a time with validation + NL conversion
+    Collect required fields from the user one at a time,
+    with validation and natural language conversion.
     """
     values = {}
     primary = contract.get("primary_fields", [])
@@ -631,77 +621,40 @@ def collect_primary_fields(contract: dict) -> dict:
         print("\n  Agent > No input needed — everything is auto-filled!")
         return values
 
-    static_fields = [f for f in primary if not f.get("is_dynamic", True)]
-    dynamic_fields = [f for f in primary if f.get("is_dynamic", True)]
+    total = len(primary)
+    print(f"\n  Agent > I need {total} thing{'s' if total > 1 else ''} from you.")
 
-    # Auto-fill static fields (inferred from objective)
-    if static_fields:
-        print("\n  Agent > I inferred these from your request:")
-        for field in static_fields:
-            label = field.get("label", field["field_key"])
-            gen_value = field.get("generated_value", "")
-            gen_desc = field.get("generated_description", "")
-            if gen_value:
-                values[field["field_key"]] = gen_value
-                reason = f" ({gen_desc})" if gen_desc else ""
-                print(f"    • {label}: {gen_value}{reason}")
+    for i, field in enumerate(primary, 1):
+        label = field.get("label", field["field_key"])
+        desc = field.get("description", "")
+        field_key = field["field_key"]
 
-        # Let user override if they want
-        try:
-            override = input("\n  Agent > Look good? Press Enter to confirm, or type 'edit' to change > ").strip()
-        except (EOFError, KeyboardInterrupt):
-            return values
-
-        if override.lower() == "edit":
-            for field in static_fields:
-                label = field.get("label", field["field_key"])
-                current = values.get(field["field_key"], "")
-                try:
-                    new_val = input(f"    {label} [{current}] > ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    return values
-                if new_val:
-                    values[field["field_key"]] = new_val
-
-    # Collect dynamic fields from user
-    if dynamic_fields:
-        total = len(dynamic_fields)
-        if static_fields:
-            print(f"\n  Agent > Now I just need {total} more thing{'s' if total > 1 else ''} from you.")
+        if desc:
+            print(f"\n  Agent > ({i}/{total}) {desc}")
         else:
-            print(f"\n  Agent > I need {total} thing{'s' if total > 1 else ''} from you.")
+            print(f"\n  Agent > ({i}/{total}) What's the {label}?")
 
-        for i, field in enumerate(dynamic_fields, 1):
-            label = field.get("label", field["field_key"])
-            desc = field.get("description", "")
-            field_key = field["field_key"]
+        while True:
+            try:
+                val = input(f"  You > ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return values
 
-            if desc:
-                print(f"\n  Agent > ({i}/{total}) {desc}")
-            else:
-                print(f"\n  Agent > ({i}/{total}) What's the {label}?")
+            if not val:
+                print(f"  Agent > I need this to proceed. Please enter the {label}.")
+                continue
 
-            while True:
-                try:
-                    val = input(f"  You > ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    return values
+            is_valid, error_msg = validate_input(field_key, val)
+            if not is_valid:
+                print(f"  Agent > {error_msg}")
+                continue
 
-                if not val:
-                    print(f"  Agent > I need this to proceed. Please enter the {label}.")
-                    continue
+            converted = convert_natural_language(field_key, desc or label, val)
+            if converted != val:
+                print(f"  Agent > Got it! I'll use: {converted}")
 
-                is_valid, error_msg = validate_input(field_key, val)
-                if not is_valid:
-                    print(f"  Agent > {error_msg}")
-                    continue
-
-                converted = convert_natural_language(field_key, desc or label, val)
-                if converted != val:
-                    print(f"  Agent > Got it! I'll use: {converted}")
-
-                values[field_key] = converted
-                break
+            values[field_key] = converted
+            break
 
     return values
 
@@ -727,10 +680,8 @@ def merge_and_execute(contract: dict, user_values: dict) -> str:
     for field in contract.get("primary_fields", []):
         key = field["field_key"]
         label = field.get("label", key)
-        is_dynamic = field.get("is_dynamic", True)
-        tag = "" if is_dynamic else " [inferred]"
         if key in user_values:
-            print(f"    • {label}: {user_values[key]}{tag}")
+            print(f"    • {label}: {user_values[key]}")
 
     secondary = contract.get("secondary_fields", [])
     if secondary:
@@ -807,6 +758,31 @@ def detect_function(user_input: str) -> str:
     return None
 
 
+CONTRACTS_DIR = os.path.join(os.path.dirname(__file__), "contracts")
+
+
+def save_json_contract(contract: dict, user_query: str):
+    """Save the JSON contract to a file for review/debugging."""
+    os.makedirs(CONTRACTS_DIR, exist_ok=True)
+
+    from datetime import datetime, timezone, timedelta
+    ist = timezone(timedelta(hours=5, minutes=30))
+    timestamp = datetime.now(ist).strftime("%Y%m%d_%H%M%S")
+    tool_slug = contract.get("tool_slug", "unknown")
+    filename = f"{timestamp}_{tool_slug}.json"
+    filepath = os.path.join(CONTRACTS_DIR, filename)
+
+    output = {
+        "user_query": user_query,
+        "contract": contract,
+    }
+
+    with open(filepath, "w") as f:
+        json.dump(output, f, indent=2)
+
+    print(f"  Contract saved → contracts/{filename}")
+
+
 def run_chatbot(agent_app, connected_apps: list, user_id: str):
     """Interactive chatbot with AI tool abstraction."""
     print("\n" + "=" * 60)
@@ -870,13 +846,13 @@ def run_chatbot(agent_app, connected_apps: list, user_id: str):
 
             contract = classify_tool_fields(query, matched_tool, user_id)
             if contract:
-                primary = contract.get("primary_fields", [])
-                static_count = sum(1 for f in primary if not f.get("is_dynamic", True))
-                dynamic_count = sum(1 for f in primary if f.get("is_dynamic", True))
+                primary_count = len(contract.get("primary_fields", []))
                 secondary_count = len(contract.get("secondary_fields", []))
                 auto_count = len(contract.get("auto_fields", []))
-                print(f"  Fields: {static_count} static + {dynamic_count} dynamic primary, "
-                      f"{secondary_count} secondary, {auto_count} auto")
+                print(f"  Fields: {primary_count} required, {secondary_count} defaults, {auto_count} auto")
+
+                # Save JSON contract to file
+                save_json_contract(contract, query)
 
                 # Collect only primary fields from user
                 user_values = collect_primary_fields(contract)
